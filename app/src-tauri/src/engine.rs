@@ -350,7 +350,7 @@ impl Engine {
     async fn finish_register(&self, mut account: Acc, email: String) -> Result<(), String> {
         let connection = self.connection.lock().await.clone().ok_or("not started")?;
         account
-            .update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"])
+            .update_postdata("Apple Device", None, &["imessage", "facetime"])
             .await
             .map_err(|e| format!("postdata: {e:?}"))?;
         let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE];
@@ -360,7 +360,7 @@ impl Engine {
             &account,
             None,
             self.config.as_ref(),
-            &[LoginDelegate::IDS, LoginDelegate::MobileMe],
+            &[LoginDelegate::IDS],
         )
         .await
         .map_err(|e| format!("delegates: {e:?}"))?;

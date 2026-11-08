@@ -327,12 +327,31 @@ async fn spotify_queue(uri: String) -> R<()> {
     tauri::async_runtime::spawn_blocking(move || spotify::queue_add(&uri)).await.map_err(e)?
 }
 
+fn seed_anisette_libs(anisette_dir: &std::path::Path) {
+    let lib_dir = anisette_dir.join("lib").join("x86_64");
+    let _ = std::fs::create_dir_all(&lib_dir);
+    const LIBS: &[(&str, &[u8])] = &[
+        ("libCoreADI.so", include_bytes!("../../../anisette-libs/lib/x86_64/libCoreADI.so")),
+        ("libCoreFP.so", include_bytes!("../../../anisette-libs/lib/x86_64/libCoreFP.so")),
+        ("libCoreLSKD.so", include_bytes!("../../../anisette-libs/lib/x86_64/libCoreLSKD.so")),
+        ("libFPDIFor3P.so", include_bytes!("../../../anisette-libs/lib/x86_64/libFPDIFor3P.so")),
+        ("libstoreservicescore.so", include_bytes!("../../../anisette-libs/lib/x86_64/libstoreservicescore.so")),
+    ];
+    for (name, bytes) in LIBS {
+        let path = lib_dir.join(name);
+        if !path.exists() {
+            let _ = std::fs::write(&path, bytes);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = Store::open().expect("couldn't open the message database");
     let data_dir = store::data_dir();
     let anisette_dir = data_dir.join("anisette");
     let _ = std::fs::create_dir_all(&anisette_dir);
+    seed_anisette_libs(&anisette_dir);
     let engine = Arc::new(Engine::new(data_dir, anisette_dir));
     let engine_start = engine.clone();
     let engine_incoming = engine.clone();
