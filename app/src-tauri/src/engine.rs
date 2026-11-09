@@ -36,7 +36,34 @@ fn b64(s: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }
 
-fn baked() -> MacOSConfig {
+// A crash mid-write must not leave a half plist: the app would read it as signed out and lose the login.
+fn save_plist<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    plist::to_writer_xml(&mut bytes, value).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("plist.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+fn device_id(data_dir: &std::path::Path) -> String {
+    // IDS ties the registration to this id: a fresh one per launch would orphan the saved login
+    let path = data_dir.join("device_id");
+    match std::fs::read_to_string(&path) {
+        Ok(id) if !id.trim().is_empty() => return id.trim().to_string(),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // an unreadable file must not silently mint a new id and orphan the saved login
+        Err(err) => panic!("couldn't read the device id: {err}"),
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::write(&path, &id).expect("couldn't save the device id");
+    id
+}
+
+fn baked(device_id: String) -> MacOSConfig {
     let mac: [u8; 6] = b64("8BiYGS+5").try_into().unwrap();
     MacOSConfig {
         inner: HardwareConfig {
@@ -57,7 +84,7 @@ fn baked() -> MacOSConfig {
         },
         version: "13.6.4".to_string(),
         protocol_version: 1660,
-        device_id: uuid::Uuid::new_v4().to_string(),
+        device_id,
         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
@@ -154,9 +181,9 @@ pub fn not_ready() -> String {
 impl Engine {
     pub fn new(data_dir: PathBuf, anisette_dir: PathBuf) -> Engine {
         Engine {
+            config: Arc::new(baked(device_id(&data_dir))),
             data_dir,
             anisette_dir,
-            config: Arc::new(baked()),
             connection: Mutex::new(None),
             anisette: Mutex::new(None),
             session: Mutex::new(None),
@@ -178,7 +205,9 @@ impl Engine {
             update_state: {
                 let ks_path = ks_path.clone();
                 Box::new(move |state| {
-                    let _ = plist::to_file_xml(&ks_path, state);
+                    if let Err(err) = save_plist(&ks_path, state) {
+                        eprintln!("keystore save failed: {err}");
+                    }
                 })
             },
             encryptor: keystore::software::NoEncryptor,
@@ -200,6 +229,11 @@ impl Engine {
 
     fn reg_path(&self) -> PathBuf {
         self.data_dir.join("registration.plist")
+    }
+
+    // The engine is not "registered" until start() has built the client; a saved login already means real chats.
+    pub fn has_saved_login(&self) -> bool {
+        self.reg_path().exists()
     }
 
     async fn build_client(&self, connection: APSConnection, users: Vec<IDSUser>, identity: IDSNGMIdentity) {
@@ -297,7 +331,10 @@ impl Engine {
                     display: format!("{} (...{})", p.number_with_dial_code, p.last_two_digits),
                 })
                 .collect(),
-            Err(_) => vec![],
+            Err(err) => {
+                eprintln!("couldn't list trusted phones: {err:?}");
+                vec![]
+            }
         };
         *self.session.lock().await = Some(Session {
             account,
@@ -376,14 +413,14 @@ impl Engine {
             &identity,
         )
         .await
-        .map_err(|e| format!("register: {e:?}"))?;
+        .map_err(|e| format!("register: {e}"))?;
         let saved = SavedState {
             push: connection.state.read().await.clone(),
             identity: identity.clone(),
             users: users.clone(),
             apple_id: email.clone(),
         };
-        let _ = plist::to_file_xml(self.reg_path(), &saved);
+        save_plist(&self.reg_path(), &saved).map_err(|e| format!("couldn't save the login: {e}"))?;
         *self.apple_id.lock().await = email;
         self.build_client(connection, users, identity).await;
         Ok(())
@@ -423,5 +460,23 @@ impl Engine {
         );
         client.send(&mut msg).await.map_err(|e| format!("{e:?}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_plist_replaces_the_file_whole_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("winmessages-test-plist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registration.plist");
+        std::fs::write(&path, "old content that is not a plist").unwrap();
+        save_plist(&path, &plist::Dictionary::from_iter([("k".to_string(), plist::Value::String("v".into()))])).unwrap();
+        let back: plist::Dictionary = plist::from_file(&path).unwrap();
+        assert_eq!(back.get("k").and_then(|v| v.as_string()), Some("v"));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "only the plist remains: {leftovers:?}");
     }
 }

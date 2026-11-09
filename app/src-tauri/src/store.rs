@@ -41,8 +41,14 @@ pub struct Store {
 }
 
 pub fn data_dir() -> PathBuf {
-    let d = dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("winmessages");
-    let _ = std::fs::create_dir_all(&d);
+    let d = dirs::data_dir().expect("no user data directory").join("winmessages");
+    std::fs::create_dir_all(&d).expect("couldn't create the data directory");
+    // keystore.plist and registration.plist hold plaintext Apple tokens: owner-only
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("couldn't restrict the data directory");
+    }
     d
 }
 
@@ -52,7 +58,11 @@ pub fn now_ms() -> i64 {
 
 impl Store {
     pub fn open() -> rusqlite::Result<Store> {
-        let db = Connection::open(data_dir().join("messages.db"))?;
+        Store::open_at(&data_dir().join("messages.db"))
+    }
+
+    fn open_at(path: &std::path::Path) -> rusqlite::Result<Store> {
+        let db = Connection::open(path)?;
         db.execute_batch(
             "pragma journal_mode=wal;
              create table if not exists chats(
@@ -68,8 +78,11 @@ impl Store {
              create index if not exists messages_chat on messages(chat_id, ts);
              create table if not exists kv(k text primary key, v text not null);",
         )?;
+        // a message still "sending" or past its schedule at startup was never sent: say so, except in demo chats
+        db.execute("update messages set status='failed' where from_me=1 and status='sending' and chat_id not in (select id from chats where demo=1)", [])?;
         db.execute("update messages set status='delivered' where from_me=1 and status='sending'", [])?;
         let now = chrono::Utc::now().timestamp_millis();
+        db.execute("update messages set status='failed' where from_me=1 and status='scheduled' and ts<=?1 and chat_id not in (select id from chats where demo=1)", params![now])?;
         db.execute("update messages set status='delivered' where from_me=1 and status='scheduled' and ts<=?1", params![now])?;
         let s = Store { db };
         if s.get_kv("seeded")?.is_none() {
@@ -187,6 +200,35 @@ impl Store {
         Ok(())
     }
 
+    // Chats made while signed out are demo chats; once registered they are real. Seeded demo chats keep their demo- ids.
+    // What was typed in the sandbox was never sent, so it must not look sent or go out later.
+    pub fn promote_demo_chats(&self) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "update messages set status='failed', read_ts=null where from_me=1 and chat_id in (select id from chats where demo=1 and id not like 'demo-%')",
+            [],
+        )?;
+        self.db.execute("update chats set demo=0 where demo=1 and id not like 'demo-%'", [])
+    }
+
+    pub fn pending_scheduled(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut st = self.db.prepare("select id, ts from messages where from_me=1 and status='scheduled'")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    // The timer fires long after scheduling: send what the row says now, and only once.
+    pub fn claim_scheduled(&self, id: &str) -> rusqlite::Result<Option<(Message, Chat)>> {
+        let claimed = self.db.execute(
+            "update messages set status='sending' where id=?1 and status='scheduled'",
+            params![id],
+        )?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        let Some(m) = self.message(id)? else { return Ok(None) };
+        Ok(self.chat(&m.chat_id)?.map(|c| (m, c)))
+    }
+
     pub fn set_reactions(&self, id: &str, r: &[Reaction]) -> rusqlite::Result<()> {
         self.db.execute(
             "update messages set reactions=?2 where id=?1",
@@ -231,7 +273,7 @@ impl Store {
     pub fn upsert_chat(&self, id: &str, name: &str, handles: &[String], service: &str, demo: bool) -> rusqlite::Result<()> {
         self.db.execute(
             "insert into chats(id, name, handles, service, demo) values(?1,?2,?3,?4,?5)
-             on conflict(id) do update set name=excluded.name, handles=excluded.handles",
+             on conflict(id) do update set name=excluded.name, handles=excluded.handles, demo=excluded.demo",
             params![id, name, serde_json::to_string(handles).unwrap(), service, demo as i64],
         )?;
         Ok(())
@@ -327,5 +369,97 @@ impl Store {
         }
         self.db.execute("update chats set unread=1 where id in ('demo-aiyan','demo-mom')", [])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outgoing(id: &str, chat: &str, status: &str) -> Message {
+        Message {
+            id: id.into(),
+            chat_id: chat.into(),
+            from_me: true,
+            sender: "me".into(),
+            text: "hi".into(),
+            ts: 1,
+            status: status.into(),
+            read_ts: None,
+            reactions: vec![],
+            edited: false,
+            reply_to: None,
+        }
+    }
+
+    fn scratch_db(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("winmessages-test-{name}-{}.db", uuid::Uuid::new_v4()));
+        p
+    }
+
+    #[test]
+    fn unsent_messages_in_real_chats_fail_at_startup_demo_ones_do_not() {
+        let path = scratch_db("startup");
+        let s = Store::open_at(&path).unwrap();
+        s.upsert_chat("chat-real", "r", &["mailto:r@x".into()], "iMessage", false).unwrap();
+        s.upsert_chat("chat-demo", "d", &["mailto:d@x".into()], "iMessage", true).unwrap();
+        s.insert(&outgoing("m1", "chat-real", "sending")).unwrap();
+        s.insert(&outgoing("m2", "chat-real", "scheduled")).unwrap();
+        s.insert(&outgoing("m3", "chat-demo", "sending")).unwrap();
+        s.insert(&outgoing("m4", "chat-demo", "scheduled")).unwrap();
+        s.insert(&outgoing("m6", "chat-gone", "sending")).unwrap();
+        let mut future = outgoing("m5", "chat-real", "scheduled");
+        future.ts = 4_102_444_800_000;
+        s.insert(&future).unwrap();
+        drop(s);
+        let s = Store::open_at(&path).unwrap();
+        assert_eq!(s.message("m5").unwrap().unwrap().status, "scheduled", "a future schedule must survive startup");
+        assert_eq!(s.message("m1").unwrap().unwrap().status, "failed");
+        assert_eq!(s.message("m2").unwrap().unwrap().status, "failed");
+        assert_eq!(s.message("m3").unwrap().unwrap().status, "delivered");
+        assert_eq!(s.message("m4").unwrap().unwrap().status, "delivered");
+        assert_eq!(s.message("m6").unwrap().unwrap().status, "failed", "a message with no chat was never sent either");
+    }
+
+    #[test]
+    fn upsert_flips_a_demo_chat_to_real() {
+        let s = Store::open_at(&scratch_db("flip")).unwrap();
+        s.upsert_chat("chat-x", "x", &["mailto:x@x".into()], "iMessage", true).unwrap();
+        s.upsert_chat("chat-x", "x", &["mailto:x@x".into()], "iMessage", false).unwrap();
+        assert!(!s.chat("chat-x").unwrap().unwrap().demo);
+    }
+
+    #[test]
+    fn promote_demo_chats_makes_user_chats_real_and_keeps_the_seeded_ones() {
+        let s = Store::open_at(&scratch_db("promote")).unwrap();
+        s.upsert_chat("chat-a", "a", &["mailto:a@x".into()], "iMessage", true).unwrap();
+        let mut simulated = outgoing("p1", "chat-a", "read");
+        simulated.read_ts = Some(5);
+        s.insert(&simulated).unwrap();
+        s.insert(&outgoing("p2", "chat-a", "scheduled")).unwrap();
+        assert_eq!(s.promote_demo_chats().unwrap(), 1);
+        assert!(!s.chat("chat-a").unwrap().unwrap().demo);
+        assert_eq!(s.message("p1").unwrap().unwrap().status, "failed", "simulated history must not look sent");
+        assert_eq!(s.message("p1").unwrap().unwrap().read_ts, None);
+        assert_eq!(s.message("p2").unwrap().unwrap().status, "failed", "a sandbox schedule must not send for real");
+        assert!(s.chat("demo-aiyan").unwrap().unwrap().demo, "seeded demo chats stay demo");
+        assert!(s.messages("demo-ram").unwrap().iter().any(|m| m.status == "read"), "seeded history is untouched");
+    }
+
+    #[test]
+    fn claim_scheduled_sends_current_text_once_and_skips_deleted() {
+        let s = Store::open_at(&scratch_db("claim")).unwrap();
+        s.upsert_chat("chat-r", "r", &["mailto:r@x".into()], "iMessage", false).unwrap();
+        s.insert(&outgoing("a", "chat-r", "scheduled")).unwrap();
+        s.insert(&outgoing("b", "chat-r", "scheduled")).unwrap();
+        s.edit("a", "edited text").unwrap();
+        s.delete_message("b").unwrap();
+        assert_eq!(s.pending_scheduled().unwrap(), vec![("a".to_string(), 1)]);
+        let (m, c) = s.claim_scheduled("a").unwrap().expect("a is still scheduled");
+        assert_eq!(m.text, "edited text");
+        assert_eq!(c.handles, vec!["mailto:r@x".to_string()]);
+        assert_eq!(s.message("a").unwrap().unwrap().status, "sending");
+        assert!(s.claim_scheduled("a").unwrap().is_none(), "second claim must not send again");
+        assert!(s.claim_scheduled("b").unwrap().is_none(), "deleted message must not send");
     }
 }

@@ -105,10 +105,12 @@ async fn new_chat(handle: AppHandle, app: State<'_, App>, to: String) -> R<Strin
     let h = normalize_handle(&to);
     let id = format!("chat-{}", h);
     let name = handle_display(&h);
-    let registered = app.engine.is_registered().await;
+    let registered = app.engine.is_registered().await || app.engine.has_saved_login();
     {
         let store = app.store.lock().unwrap();
-        if store.chat(&id).map_err(e)?.is_none() {
+        // a chat made while signed out is a demo chat: flip it to real once registered, or sends stay simulated
+        let stale_demo = store.chat(&id).map_err(e)?.map(|c| c.demo && registered);
+        if stale_demo.unwrap_or(true) {
             store.upsert_chat(&id, &name, &[h.clone()], "iMessage", !registered).map_err(e)?;
         }
     }
@@ -156,7 +158,8 @@ fn real_send(handle: AppHandle, engine: Arc<Engine>, msg_id: String, to: Vec<Str
             Ok(_) => {
                 let _ = s.set_status(&msg_id, "delivered", None);
             }
-            Err(_) => {
+            Err(err) => {
+                eprintln!("send failed: {err}");
                 let _ = s.set_status(&msg_id, "failed", None);
             }
         }
@@ -183,6 +186,36 @@ fn simulate_delivery(handle: AppHandle, id: String) {
         let _ = s.set_status(&id, "read", Some(now_ms()));
         if let Ok(Some(m)) = s.message(&id) {
             let _ = handle.emit("message", m);
+        }
+    });
+}
+
+// Waits on the wall clock in short steps: a monotonic sleep does not count time spent suspended.
+fn schedule_send(handle: AppHandle, engine: Arc<Engine>, id: String, due_ms: i64) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let left = due_ms - now_ms();
+            if left <= 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(left.min(30_000) as u64)).await;
+        }
+        let claimed = {
+            let st = handle.state::<App>();
+            let s = st.store.lock().unwrap();
+            s.claim_scheduled(&id)
+        };
+        match claimed {
+            Ok(Some((m, chat))) => {
+                let _ = handle.emit("message", m.clone());
+                if chat.demo {
+                    simulate_delivery(handle, id);
+                } else {
+                    real_send(handle, engine, id, chat.handles, m.text);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("scheduled send lookup failed: {err}"),
         }
     });
 }
@@ -214,21 +247,7 @@ fn send(handle: AppHandle, app: State<App>, chat_id: String, text: String, reply
     let _ = handle.emit("message", m.clone());
     let _ = handle.emit("chats", ());
     if scheduled {
-        let h = handle.clone();
-        let id = m.id.clone();
-        let wait = (send_at.unwrap() - now_ms()).max(0) as u64;
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(wait)).await;
-            {
-                let st = h.state::<App>();
-                let s = st.store.lock().unwrap();
-                let _ = s.set_status(&id, "sending", None);
-                if let Ok(Some(m)) = s.message(&id) {
-                    let _ = h.emit("message", m);
-                }
-            }
-            simulate_delivery(h, id);
-        });
+        schedule_send(handle, app.engine.clone(), m.id.clone(), send_at.unwrap());
     } else if chat.demo {
         simulate_delivery(handle, m.id.clone());
     } else {
@@ -270,9 +289,23 @@ fn unsend(handle: AppHandle, app: State<App>, message_id: String) -> R<()> {
     Ok(())
 }
 
+fn promote_chats(handle: &AppHandle) {
+    let result = handle.state::<App>().store.lock().unwrap().promote_demo_chats();
+    match result {
+        Ok(_) => {
+            let _ = handle.emit("chats", ());
+        }
+        Err(err) => eprintln!("couldn't mark chats as real after sign-in: {err}"),
+    }
+}
+
 #[tauri::command]
-async fn sign_in(app: State<'_, App>, apple_id: String, password: String) -> R<SignInResult> {
-    app.engine.sign_in(&apple_id, &password).await
+async fn sign_in(handle: AppHandle, app: State<'_, App>, apple_id: String, password: String) -> R<SignInResult> {
+    let result = app.engine.sign_in(&apple_id, &password).await?;
+    if matches!(result, SignInResult::LoggedIn) {
+        promote_chats(&handle);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -288,6 +321,7 @@ async fn use_sms(app: State<'_, App>, phone_id: u32) -> R<()> {
 #[tauri::command]
 async fn submit_code(handle: AppHandle, app: State<'_, App>, code: String) -> R<Account> {
     app.engine.submit_code(code).await?;
+    promote_chats(&handle);
     let acc = app.engine.account_state().await;
     let _ = handle.emit("chats", ());
     Ok(acc)
@@ -329,6 +363,7 @@ async fn spotify_queue(uri: String) -> R<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = pretty_env_logger::try_init();
     let store = Store::open().expect("couldn't open the message database");
     let data_dir = store::data_dir();
     let anisette_dir = data_dir.join("anisette");
@@ -354,6 +389,19 @@ pub fn run() {
                     eprintln!("engine start failed: {err}");
                 }
                 let acc = engine_start.account_state().await;
+                if acc.state == "signed_in" {
+                    promote_chats(&start_h);
+                }
+                // after start: a send claimed before the engine has a client would fail
+                let pending = start_h.state::<App>().store.lock().unwrap().pending_scheduled();
+                match pending {
+                    Ok(list) => {
+                        for (id, ts) in list {
+                            schedule_send(start_h.clone(), engine_start.clone(), id, ts);
+                        }
+                    }
+                    Err(err) => eprintln!("couldn't reload scheduled messages: {err}"),
+                }
                 let _ = start_h.emit("account", acc);
                 let _ = start_h.emit("chats", ());
             });
