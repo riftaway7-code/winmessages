@@ -2,11 +2,13 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static CACHE: once_cell::sync::Lazy<Mutex<HashMap<String, Track>>> =
@@ -47,11 +49,11 @@ fn run(args: &[&str]) -> Result<Value, String> {
     let mut full: Vec<&str> = args.to_vec();
     full.push("--format");
     full.push("json");
-    let out = Command::new(exe)
-        .args(&full)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.args(&full);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     if text.trim().is_empty() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
